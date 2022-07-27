@@ -2,4 +2,4 @@ project: shim
 target: buildid
 
 cmds:
-  - cmd: /repo/buildid @@
+  - cmd: /buildid @@
