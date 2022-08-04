@@ -5,6 +5,11 @@
 
 #include "shim.h"
 
+extern struct {
+	UINT32 previous_offset;
+	UINT32 latest_offset;
+} sbat_var_payload_header;
+
 EFI_STATUS
 parse_sbat_section(char *section_base, size_t section_size,
 		   size_t *n_entries,
@@ -289,6 +294,7 @@ parse_sbat_var(list_t *entries)
 	UINT8 *data = 0;
 	UINTN datasize;
 	EFI_STATUS efi_status;
+	list_t *pos = NULL;
 
 	if (!entries) {
 		dprint(L"entries is NULL\n");
@@ -305,7 +311,20 @@ parse_sbat_var(list_t *entries)
 	 * We've intentionally made sure there's a NUL byte on all variable
 	 * allocations, so use that here.
 	 */
-	return parse_sbat_var_data(entries, data, datasize+1);
+	efi_status = parse_sbat_var_data(entries, data, datasize+1);
+	if (EFI_ERROR(efi_status))
+		return efi_status;
+
+	dprint(L"SBAT variable entries:\n");
+	list_for_each(pos, entries) {
+		struct sbat_var_entry *entry;
+
+		entry = list_entry(pos, struct sbat_var_entry, list);
+		dprint(L"%a, %a, %a\n", entry->component_name,
+		       entry->component_generation, entry->sbat_datestamp);
+	}
+
+	return efi_status;
 }
 
 static bool
@@ -319,16 +338,64 @@ check_sbat_var_attributes(UINT32 attributes)
 #endif
 }
 
+static char *
+nth_sbat_field(char *str, size_t limit, int n)
+{
+	size_t i;
+	for (i = 0; i < limit && str[i] != '\0'; i++) {
+		if (n == 0)
+			return &str[i];
+		if (str[i] == ',')
+			n--;
+	}
+	return &str[i];
+}
+
 bool
 preserve_sbat_uefi_variable(UINT8 *sbat, UINTN sbatsize, UINT32 attributes,
 		char *sbat_var)
 {
-	const char *sbatc = (const char *)sbat;
+	char *sbatc = (char *)sbat;
+	char *current_version, *new_version,
+	     *current_datestamp, *new_datestamp;
+	int current_version_len, new_version_len;
 
-	return check_sbat_var_attributes(attributes) &&
-	       sbatsize >= strlen(SBAT_VAR_ORIGINAL) &&
-	       !strcmp(sbatc, SBAT_VAR_SIG SBAT_VAR_VERSION) &&
-	       strcmp(sbatc, sbat_var) >= 0;
+	/* current metadata is not currupt somehow */
+	if (!check_sbat_var_attributes(attributes) ||
+               sbatsize < strlen(SBAT_VAR_ORIGINAL) ||
+	       strncmp(sbatc, SBAT_VAR_SIG, strlen(SBAT_VAR_SIG)))
+		return false;
+
+	/* current metadata version not newer */
+	current_version = nth_sbat_field(sbatc, sbatsize, 1);
+	new_version = nth_sbat_field(sbat_var, strlen(sbat_var)+1, 1);
+	current_datestamp = nth_sbat_field(sbatc, sbatsize, 2);
+	new_datestamp = nth_sbat_field(sbat_var, strlen(sbat_var)+1, 2);
+
+	current_version_len = current_datestamp - current_version - 1;
+	new_version_len = new_datestamp - new_version - 1;
+
+	if (current_version_len > new_version_len ||
+	    (current_version_len == new_version_len &&
+	    strncmp(current_version, new_version, new_version_len) > 0))
+		return true;
+
+	/* current datestamp is not newer or idential */
+	if (strncmp(current_datestamp, new_datestamp,
+	    strlen(SBAT_VAR_ORIGINAL_DATE)) >= 0)
+                return true;
+
+	return false;
+}
+
+static void
+clear_sbat_policy()
+{
+	EFI_STATUS efi_status = EFI_SUCCESS;
+
+	efi_status = del_variable(SBAT_POLICY, SHIM_LOCK_GUID);
+	if (EFI_ERROR(efi_status))
+		console_error(L"Could not reset SBAT Policy", efi_status);
 }
 
 EFI_STATUS
@@ -336,6 +403,9 @@ set_sbat_uefi_variable(void)
 {
 	EFI_STATUS efi_status = EFI_SUCCESS;
 	UINT32 attributes = 0;
+
+	char *sbat_var_previous;
+	char *sbat_var_latest;
 
 	UINT8 *sbat = NULL;
 	UINT8 *sbat_policy = NULL;
@@ -345,44 +415,42 @@ set_sbat_uefi_variable(void)
 	char *sbat_var = NULL;
 	bool reset_sbat = false;
 
+	sbat_var_previous = (char *)&sbat_var_payload_header + sbat_var_payload_header.previous_offset;
+	sbat_var_latest = (char *)&sbat_var_payload_header + sbat_var_payload_header.latest_offset;
+
 	efi_status = get_variable_attr(SBAT_POLICY, &sbat_policy,
 				       &sbat_policysize, SHIM_LOCK_GUID,
 				       &attributes);
 	if (EFI_ERROR(efi_status)) {
 		dprint("Default sbat policy: previous\n");
-		sbat_var = SBAT_VAR_PREVIOUS;
+		sbat_var = sbat_var_previous;
 	} else {
 		switch (*sbat_policy) {
 			case SBAT_POLICY_LATEST:
 				dprint("Custom sbat policy: latest\n");
-				sbat_var = SBAT_VAR_LATEST;
+				sbat_var = sbat_var_latest;
+				clear_sbat_policy();
 				break;
 			case SBAT_POLICY_PREVIOUS:
 				dprint("Custom sbat policy: previous\n");
-				sbat_var = SBAT_VAR_PREVIOUS;
+				sbat_var = sbat_var_previous;
 				break;
 			case SBAT_POLICY_RESET:
 				if (secure_mode()) {
 					console_print(L"Cannot reset SBAT policy: Secure Boot is enabled.\n");
-					sbat_var = SBAT_VAR_PREVIOUS;
+					sbat_var = sbat_var_previous;
 				} else {
 					dprint(L"Custom SBAT policy: reset OK\n");
 					reset_sbat = true;
 					sbat_var = SBAT_VAR_ORIGINAL;
 				}
-				efi_status = del_variable(SBAT_POLICY, SHIM_LOCK_GUID);
-				if (EFI_ERROR(efi_status))
-					console_error(L"Could not reset SBAT Policy",
-						      efi_status);
+				clear_sbat_policy();
 				break;
 			default:
 				console_error(L"SBAT policy state %llu is invalid",
 					      EFI_INVALID_PARAMETER);
-				efi_status = del_variable(SBAT_POLICY, SHIM_LOCK_GUID);
-				if (EFI_ERROR(efi_status))
-					console_error(L"Could not reset SBAT Policy",
-						      efi_status);
-				sbat_var = SBAT_VAR_PREVIOUS;
+				sbat_var = sbat_var_previous;
+				clear_sbat_policy();
 				break;
 		}
 	}
